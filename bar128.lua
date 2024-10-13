@@ -1,5 +1,5 @@
 local BAR128 = {
-    _VERSION     = "0.9.5",
+    _VERSION     = "0.9.1",
     _DESCRIPTION =
     "Barcode rendering library for LÖVE, based on Zanstra's JS implementation (https://zanstra.com/my/Barcode/code128.js)",
     _URL         = "https://github.com/Nawias/bar128-love",
@@ -32,9 +32,7 @@ local BAR128 = {
 ---@field private barHeight number Height of the drawn barcode
 ---@field private barWidth number width of the individual bars in pixels (default: `1`)
 ---@field private cachedBarcode number[] Parsed barcode ready for rendering
----@field private fullWidth number Full width of the barcode calculated on demand
 ---@field private __index Barcode
----@overload fun(code:string|number, barHeight: number?, barWidth: number?, barcodeType: 'A'|'B'|'C'|nil):Barcode
 local Barcode = {}
 Barcode.__index = Barcode
 
@@ -174,46 +172,89 @@ local fromType = {
     end
 }
 
----Parses code into bars
+---Parses code into bars, with optional support for subset switching
 ---@param code string|number Alphanumerical code
 ---@param barcodeType 'A'|'B'|'C'
+---@param enableSubsetSwitching boolean Flag to enable or disable subset switching
 ---@return number[] bars Code parsed into bars
-local function parseBarcode(code, barcodeType)
-    if (barcodeType == 'C' and string.len(code) % 2 == 1) then
-        -- Append a leading 0 for digit parity
+local function parseBarcode(code, barcodeType, enableSubsetSwitching)
+    if barcodeType == 'C' and string.len(code) % 2 == 1 then
+        -- Append a leading 0 for digit parity if using Code C
         code = '0' .. code
     end
+    
     local bars = {}
     local checksum = 0
+    local currentBarcodeType = barcodeType -- Track the current subset being used
+
     local function add(barIndex)
         local nrCode = BARS[barIndex]
         local barsLen = #bars
         checksum = (barsLen == 0) and barIndex or checksum + barIndex * barsLen
         table.insert(bars, nrCode or ('UNDEFINED: ' .. barIndex .. '->' .. nrCode))
     end
-    add(START_CODE[barcodeType])
+
+    -- Start with the initial subset
+    add(START_CODE[currentBarcodeType])
+    
     local i = 1
-    repeat
-        local barCode
-        if barcodeType == 'C' then
-            barCode = tonumber(string.sub(code, i, i + 1))
-            i = i + 1
+    while i <= string.len(code) do
+        local char = string.sub(code, i, i)
+        
+        -- Determine the appropriate subset based on the character
+        local requiredBarcodeType
+        if char:match("%d") and i < string.len(code) and string.sub(code, i + 1, i + 1):match("%d") then
+            -- Handle two-digit pairs for Code 128C
+            requiredBarcodeType = 'C'
+        elseif char:match("%l") then
+            requiredBarcodeType = 'B' -- For lowercase letters
         else
-            barCode = string.byte(code, i)
+            requiredBarcodeType = 'A' -- For control characters or uppercase
         end
-        local converted = fromType[barcodeType](barCode)
-        if ('number' ~= type(converted) or converted < 0 or converted > 106) then
+        
+        -- Switch subsets if necessary and enabled
+        if enableSubsetSwitching and requiredBarcodeType ~= currentBarcodeType then
+            if requiredBarcodeType == 'C' then
+                add(99) -- Switch to Code C
+            elseif requiredBarcodeType == 'A' then
+                add(101) -- Switch to Code A
+            elseif requiredBarcodeType == 'B' then
+                add(100) -- Switch to Code B
+            end
+            currentBarcodeType = requiredBarcodeType
+        end
+
+        -- Encode the character based on the current subset
+        local barCode
+        if currentBarcodeType == 'C' then
+            -- Take two digits for Code C, make sure both characters are digits
+            local pair = string.sub(code, i, i + 1)
+            if pair:match("%d%d") then
+                barCode = tonumber(pair) -- Convert two-digit pair to number
+                i = i + 1 -- Move an extra character forward
+            else
+                error("Code 128C requires two digits. Invalid pair at position " .. i)
+            end
+        else
+            barCode = string.byte(char) -- Get the byte value of the character
+        end
+
+        local converted = fromType[currentBarcodeType](barCode)
+        if type(converted) ~= 'number' or converted < 0 or converted > 106 then
             error("Unrecognized character (" .. barCode .. ") at position " .. i .. " in code '" .. code .. "'.")
         end
         add(converted)
-
+        
         i = i + 1
-    until i > string.len(code)
+    end
 
+    -- Add checksum and stop codes
     table.insert(bars, BARS[checksum % 103])
     table.insert(bars, BARS[STOP])
+    
     return bars
 end
+
 
 ---Detects barcode charset based on characters used
 ---@param code string|number
@@ -234,19 +275,20 @@ end
 ---@param barHeight number? height of the barcode image (default: 20)
 ---@param barWidth number? width of one bar (default: 1)
 ---@param barcodeType 'A'|'B'|'C'|nil
+---@param SubsetSwitch false|true
 ---@return Barcode barcode
-local function newBarcode(self, code, barHeight, barWidth, barcodeType)
-    assert(('string' == type(code) or 'number' == type(code)) and string.len(code) > 1, "Barcode: invalid code")
+local function newBarcode(self, code, barHeight, barWidth, barcodeType, SubsetSwitch)
+    assert(('string'==type(code) or 'number'==type(code)) and string.len(code)>1,"Barcode: invalid code")
     assert(isBarcodeType(barcodeType) or barcodeType == nil, "Barcode: invalid barcode type")
-    assert(barHeight == nil or barHeight > 0, "Barcode: bar height cannot be 0 or less")
-    assert(barWidth == nil or barWidth > 0, "Barcode: bar width cannot be 0 or less")
+    assert(barHeight>0,"Barcode: bar height cannot be 0 or less")
+    assert(barWidth>0,"Barcode: bar width cannot be 0 or less")
     local object = {
         code = code,
         barHeight = barHeight or 20,
         barWidth = barWidth or 1,
         barcodeType = barcodeType or detectBarcodeType(code)
     }
-    object.cachedBarcode = parseBarcode(code, object.barcodeType)
+    object.cachedBarcode = parseBarcode(code, object.barcodeType, SubsetSwitch)
     object = setmetatable(object, Barcode)
     return object
 end
@@ -256,11 +298,25 @@ end
 ---@param text 'notext'|'text' Indicates whether the text representation should be drawn underneath the barcode.
 ---@param x number X coordinate
 ---@param y number Y coordinate
-function Barcode:draw(text, x, y)
+function Barcode:draw(text, y, S_WIDTH)
+    -- Calculate the total width of the barcode
+    local totalWidth = 0
+    for _, glyph in pairs(self.cachedBarcode) do
+        for i = 1, string.len(glyph), 1 do
+            totalWidth = totalWidth + tonumber(string.sub(glyph, i, i)) * self.barWidth
+        end
+    end
+
+    -- Add the quiet zone (10x bar width on each side)
+    totalWidth = totalWidth + (self.barWidth * 20)
+
+    -- Center the barcode on a 400px width screen
+    local x = (S_WIDTH - totalWidth) / 2
+
     -- Account for the quiet zone
     local cursor = x + self.barWidth * 10
 
-    for _, glyph in ipairs(self.cachedBarcode) do
+    for _, glyph in pairs(self.cachedBarcode) do
         local isDrawing = true
         for i = 1, string.len(glyph), 1 do
             local width = tonumber(string.sub(glyph, i, i)) * self.barWidth
@@ -283,12 +339,11 @@ end
 ---@param code string|number New barcode value
 ---@param barcodeType 'A'|'B'|'C'|nil (Optional) Force charset
 function Barcode:setCode(code, barcodeType)
-    assert(('string' == type(code) or 'number' == type(code)) and string.len(code) > 1, "Barcode: invalid code")
+    assert(('string'==type(code) or 'number'==type(code)) and string.len(code)>1,"Barcode: invalid code")
     assert(isBarcodeType(barcodeType) or barcodeType == nil, "Barcode: invalid barcode type")
     self.code = code
     self.barcodeType = barcodeType or detectBarcodeType(code)
     self.cachedBarcode = parseBarcode(code, self.barcodeType)
-    self.fullWidth = nil
 end
 
 ---Get the current bar width
@@ -300,9 +355,7 @@ end
 ---Changes the base width of bars
 ---@param width number
 function Barcode:setBarWidth(width)
-    assert(width ~= nil, "Barcode: bar width cannot be nil")
-    assert(width > 0, "Barcode: bar width cannot be 0 or less")
-    self.fullWidth = nil
+    assert(width>0,"Barcode: bar width cannot be 0 or less")
     self.barWidth = width
 end
 
@@ -315,34 +368,9 @@ end
 ---Changes the base width of bars
 ---@param height number
 function Barcode:setBarHeight(height)
-    assert(height ~= nil, "Barcode: bar height cannot be nil")
-    assert(height > 0, "Barcode: bar height cannot be 0 or less")
+    assert(height>0,"Barcode: bar height cannot be 0 or less")
     self.barHeight = height
 end
-
----Returns total width of the barcode
----
----`⚠️ Warning`: the result of this method gets cached, so the first invocation of this method after `setCode` or `setBarWidth` will take slightly longer.
----@return number fullWidth
-function Barcode:getFullWidth()
-    if self.fullWidth == nil then
-        self.fullWidth = self.barWidth * 20 -- Account for 'quiet zones'
-        for _, glyph in ipairs(self.cachedBarcode) do
-            self.fullWidth = self.fullWidth + (string.len(glyph) * 2 - 1) * self.barWidth
-        end
-    end
-    return self.fullWidth
-end
-
----Returns total size of the barcode
----
----`⚠️ Warning`: the result of this method gets cached, so the first invocation of this method after `setCode` or `setBarWidth` will take slightly longer.
----@return number fullWidth
----@return number fullHeight
-function Barcode:getFullSize()
-    return self:getFullWidth(), self.barHeight
-end
-
 --#endregion
 
 --#endregion
